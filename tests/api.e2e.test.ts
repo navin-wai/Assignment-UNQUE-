@@ -1,15 +1,6 @@
-// TASK ->
-// Automate the complete E2E workflow: 
-// Example - 
-// Register → Login → Booking → Cancel
-// Cover both positive and negative scenarios.
-// Include authentication and authorization testing.
-// Validate HTTP status codes, response data, and relevant business rules.
-// Keep the automation maintainable and avoid unnecessary duplication.
-
 import bcrypt from 'bcryptjs';
-import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import { MongoMemoryServer } from 'mongodb-memory-server';
 import request from 'supertest';
 
 import { app } from '../index';
@@ -18,231 +9,251 @@ import Salon from '../models/Salon';
 import Service from '../models/Service';
 import User from '../models/User';
 
-describe('Salon API E2E workflow', () => {
-  let mongoServer: MongoMemoryServer;
-  let salonId: string;
-  let serviceId: string;
-  let stylistId: string;
+const CUSTOMER_PASSWORD = 'password123';
+const APPOINTMENT_DATE = '2099-12-31';
+const STYLIST_EMAIL = 'stylist@test.local';
 
-  const bookingDate = '2099-12-31';
+describe('Salon backend', () => {
+  let database: MongoMemoryServer;
+  let salon: string;
+  let haircut: string;
+  let stylist: string;
 
+  const bearerToken = (token: string) => `Bearer ${token}`;
 
-  //return token
-  const registerAndLogin = async (email: string) => {
+  async function signInAsCustomer(email: string): Promise<string> {
     const registration = await request(app)
       .post('/api/register')
-      .send({ name: 'Test Customer', email, password: 'password123' });
+      .send({
+        name: 'Test Customer',
+        email,
+        password: CUSTOMER_PASSWORD
+      });
 
     expect(registration.status).toBe(201);
 
     const login = await request(app)
       .post('/api/login')
-      .send({ email, password: 'password123' });
+      .send({ email, password: CUSTOMER_PASSWORD });
 
     expect(login.status).toBe(200);
     expect(login.body.token).toEqual(expect.any(String));
-    return login.body.token as string;
-  };
 
-  //connect to db and create objects
+    return login.body.token;
+  }
+
+  function bookingDetails(time: string, extraFields = {}) {
+    return {
+      salonId: salon,
+      stylistId: stylist,
+      serviceId: haircut,
+      slotTime: time,
+      date: APPOINTMENT_DATE,
+      ...extraFields
+    };
+  }
+
+  async function bookAppointment(token: string, time: string, extraFields = {}) {
+    return request(app)
+      .post('/api/bookings')
+      .set('Authorization', bearerToken(token))
+      .send(bookingDetails(time, extraFields));
+  }
+
+  async function cancelAppointment(bookingId: string, token: string) {
+    return request(app)
+      .post(`/api/bookings/${bookingId}/cancel`)
+      .set('Authorization', bearerToken(token))
+      .send();
+  }
+
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
-    await mongoose.connect(mongoServer.getUri());
+    database = await MongoMemoryServer.create();
+    await mongoose.connect(database.getUri());
 
-    const stylist = await User.create({
+    const savedStylist = await User.create({
       name: 'Test Stylist',
-      email: 'stylist@test.local',
+      email: STYLIST_EMAIL,
       password: await bcrypt.hash('stylist123', 10),
       role: 'stylist'
     });
-    stylistId = stylist.id;
+    stylist = savedStylist.id;
 
-    const salon = await Salon.create({
+    const savedSalon = await Salon.create({
       name: 'Test Salon',
       location: 'Test Street',
       openTime: '09:00',
       closeTime: '18:00'
     });
-    salonId = salon.id;
+    salon = savedSalon.id;
 
-    const service = await Service.create({
+    const savedService = await Service.create({
       name: 'Test Haircut',
       duration: 30,
       price: 25,
-      salonId: salon._id
+      salonId: savedSalon._id
     });
-    serviceId = service.id;
+    haircut = savedService.id;
   });
-
-  //deleting after every test
 
   afterEach(async () => {
     await Booking.deleteMany({});
-    await User.deleteMany({ email: { $ne: 'stylist@test.local' } });
+    await User.deleteMany({ email: { $ne: STYLIST_EMAIL } });
   });
-
-  //stop mongodb connection
 
   afterAll(async () => {
     await mongoose.disconnect();
-    await mongoServer.stop();
+    await database.stop();
   });
 
+  describe('authentication', () => {
+    it('registers a customer and returns a token when they log in', async () => {
+      const token = await signInAsCustomer('new-customer@test.local');
 
-  //register -> login -> booking -> cancel 
+      expect(token).toEqual(expect.any(String));
+    });
 
-  it('completes register -> login -> booking -> cancel and returns business data', async () => {
-    const token = await registerAndLogin('customer@test.local');
+    it('does not allow the same email to be registered twice', async () => {
+      await signInAsCustomer('existing-customer@test.local');
 
-    const bookingResponse = await request(app)
-      .post('/api/bookings')
-      .set('Authorization', `Bearer ${token}`)
-      .send({
-        salonId,
-        stylistId,
-        serviceId,
-        slotTime: '10:00',
-        date: bookingDate
+      const response = await request(app)
+        .post('/api/register')
+        .send({
+          name: 'Second Account',
+          email: 'existing-customer@test.local',
+          password: CUSTOMER_PASSWORD
+        });
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({ error: 'Email already in use' });
+    });
+
+    it('rejects a login with the wrong password', async () => {
+      await signInAsCustomer('login-test@test.local');
+
+      const response = await request(app)
+        .post('/api/login')
+        .send({
+          email: 'login-test@test.local',
+          password: 'not-the-right-password'
+        });
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({ error: 'Invalid credentials' });
+    });
+  });
+
+  describe('bookings', () => {
+    it('creates and then cancels a customer appointment', async () => {
+      const token = await signInAsCustomer('booking-owner@test.local');
+      const created = await bookAppointment(token, '10:00');
+
+      expect(created.status).toBe(201);
+      expect(created.body.message).toBe('Booking created successfully');
+      expect(created.body.booking).toEqual(expect.objectContaining({
+        salonId: salon,
+        stylistId: stylist,
+        serviceId: haircut,
+        date: APPOINTMENT_DATE,
+        startTime: '10:00',
+        endTime: '10:30',
+        status: 'booked'
+      }));
+
+      const bookingId = created.body.booking._id;
+      const cancelled = await cancelAppointment(bookingId, token);
+
+      expect(cancelled.status).toBe(200);
+      expect(cancelled.body).toEqual({
+        message: 'Booking cancelled successfully'
       });
 
-    expect(bookingResponse.status).toBe(201);
-    expect(bookingResponse.body.message).toBe('Booking created successfully');
-    expect(bookingResponse.body.booking).toEqual(expect.objectContaining({
-      salonId,
-      stylistId,
-      serviceId,
-      date: bookingDate,
-      startTime: '10:00',
-      endTime: '10:30',
-      status: 'booked'
-    }));
+      const storedBooking = await Booking.findById(bookingId);
+      expect(storedBooking?.status).toBe('cancelled');
+    });
 
-    const cancellation = await request(app)
-      .post(`/api/bookings/${bookingResponse.body.booking._id}/cancel`)
-      .set('Authorization', `Bearer ${token}`)
-      .send();
+    it('requires a date and a real service when creating an appointment', async () => {
+      const token = await signInAsCustomer('validation@test.local');
 
-    expect(cancellation.status).toBe(200);
-    expect(cancellation.body).toEqual({ message: 'Booking cancelled successfully' });
-    await expect(Booking.findById(bookingResponse.body.booking._id)).resolves.toEqual(
-      expect.objectContaining({ status: 'cancelled' })
-    );
-  });
+      const withoutDate = await request(app)
+        .post('/api/bookings')
+        .set('Authorization', bearerToken(token))
+        .send(bookingDetails('11:00', { date: undefined }));
 
-  //duplicate and invalidLogin
-  it('rejects duplicate registration and invalid login credentials', async () => {
-    await registerAndLogin('duplicate@test.local');
+      expect(withoutDate.status).toBe(400);
+      expect(withoutDate.body).toEqual({ error: 'date is required' });
 
-    const duplicate = await request(app)
-      .post('/api/register')
-      .send({ name: 'Another Customer', email: 'duplicate@test.local', password: 'password123' });
-    expect(duplicate.status).toBe(400);
-    expect(duplicate.body.error).toBe('Email already in use');
-
-    const invalidLogin = await request(app)
-      .post('/api/login')
-      .send({ email: 'duplicate@test.local', password: 'wrong-password' });
-    expect(invalidLogin.status).toBe(400);
-    expect(invalidLogin.body.error).toBe('Invalid credentials');
-  });
-
-  //enfore authentication while booking and cacellation
-  it('enforces authentication on booking and cancellation endpoints', async () => {
-    const booking = await request(app)
-      .post('/api/bookings')
-      .send({ salonId, stylistId, serviceId, slotTime: '11:00', date: bookingDate });
-    expect(booking.status).toBe(401);
-    expect(booking.body.error).toBe('Authentication required');
-
-    const cancellation = await request(app)
-      .post('/api/bookings/507f1f77bcf86cd799439011/cancel')
-      .send();
-    expect(cancellation.status).toBe(401);
-    expect(cancellation.body.error).toBe('Authentication required');
-  });
-
-  it('rejects malformed authentication tokens', async () => {
-    const response = await request(app)
-      .post('/api/bookings')
-      .set('Authorization', 'Bearer not-a-jwt')//bearer token (not a JWT )
-      .send({ salonId, stylistId, serviceId, slotTime: '11:00', date: bookingDate });
-
-    expect(response.status).toBe(401);
-    expect(response.body.error).toBe('Invalid token');
-  });
-
-  // required booking data should also be there
-  it('validates required booking data and referenced services', async () => {
-    const token = await registerAndLogin('validation@test.local');
-
-    const missingDate = await request(app)
-      .post('/api/bookings')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ salonId, stylistId, serviceId, slotTime: '11:00' });
-    expect(missingDate.status).toBe(400);
-    expect(missingDate.body.error).toBe('date is required');
-
-    const missingService = await request(app)
-      .post('/api/bookings')
-      .set('Authorization', `Bearer ${token}`)
-      .send({
-        salonId,
-        stylistId,
-        serviceId: new mongoose.Types.ObjectId().toString(),
-        slotTime: '11:00',
-        date: bookingDate
+      const unknownService = await bookAppointment(token, '11:00', {
+        serviceId: new mongoose.Types.ObjectId().toString()
       });
-    expect(missingService.status).toBe(404);
-    expect(missingService.body.error).toBe('Service not found');
+
+      expect(unknownService.status).toBe(404);
+      expect(unknownService.body).toEqual({ error: 'Service not found' });
+    });
+
+    it('does not allow two active appointments in the same time slot', async () => {
+      const firstCustomer = await signInAsCustomer('first-customer@test.local');
+      const secondCustomer = await signInAsCustomer('second-customer@test.local');
+
+      const firstAppointment = await bookAppointment(firstCustomer, '12:00');
+      expect(firstAppointment.status).toBe(201);
+
+      const conflictingAppointment = await bookAppointment(secondCustomer, '12:00');
+      expect(conflictingAppointment.status).toBe(400);
+      expect(conflictingAppointment.body).toEqual({
+        error: 'Time slot is no longer available'
+      });
+
+      await cancelAppointment(firstAppointment.body.booking._id, firstCustomer);
+
+      const replacementAppointment = await bookAppointment(secondCustomer, '12:00');
+      expect(replacementAppointment.status).toBe(201);
+    });
   });
 
-  //prevent overlap booking (available again ? )
-  it('prevents overlapping bookings for the same stylist and allows the slot after cancellation', async () => {
-    const firstToken = await registerAndLogin('first@test.local');
-    const secondToken = await registerAndLogin('second@test.local');
+  describe('access control', () => {
+    it('rejects booking requests without a token', async () => {
+      const response = await request(app)
+        .post('/api/bookings')
+        .send(bookingDetails('14:00'));
 
-    const firstBooking = await request(app)
-      .post('/api/bookings')
-      .set('Authorization', `Bearer ${firstToken}`)//first token de diya
-      .send({ salonId, stylistId, serviceId, slotTime: '12:00', date: bookingDate });
-    expect(firstBooking.status).toBe(201);
+      expect(response.status).toBe(401);
+      expect(response.body).toEqual({ error: 'Authentication required' });
+    });
 
-    const conflict = await request(app)
-      .post('/api/bookings')
-      .set('Authorization', `Bearer ${secondToken}`)//second token de diya
-      .send({ salonId, stylistId, serviceId, slotTime: '12:00', date: bookingDate });
-    expect(conflict.status).toBe(400);
-    expect(conflict.body.error).toBe('Time slot is no longer available');
+    it('rejects cancellation requests without a token', async () => {
+      const response = await request(app)
+        .post('/api/bookings/507f1f77bcf86cd799439011/cancel')
+        .send();
 
-    await request(app)
-      .post(`/api/bookings/${firstBooking.body.booking._id}/cancel`)
-      .set('Authorization', `Bearer ${firstToken}`)
-      .send()
-      .expect(200);
+      expect(response.status).toBe(401);
+      expect(response.body).toEqual({ error: 'Authentication required' });
+    });
 
-    const availableAgain = await request(app)
-      .post('/api/bookings')
-      .set('Authorization', `Bearer ${secondToken}`)
-      .send({ salonId, stylistId, serviceId, slotTime: '12:00', date: bookingDate });
-    expect(availableAgain.status).toBe(201);
-  });
+    it('rejects an invalid bearer token', async () => {
+      const response = await request(app)
+        .post('/api/bookings')
+        .set('Authorization', bearerToken('this-is-not-a-jwt'))
+        .send(bookingDetails('14:00'));
 
-  //cancelling from another coustomer 
-  it('prevents a customer from cancelling another customer booking', async () => {
-    const ownerToken = await registerAndLogin('owner@test.local');
-    const otherToken = await registerAndLogin('other@test.local');
+      expect(response.status).toBe(401);
+      expect(response.body).toEqual({ error: 'Invalid token' });
+    });
 
-    const booking = await request(app)
-      .post('/api/bookings')
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .send({ salonId, stylistId, serviceId, slotTime: '13:00', date: bookingDate });
+    it('prevents one customer from cancelling another customer’s appointment', async () => {
+      const owner = await signInAsCustomer('appointment-owner@test.local');
+      const stranger = await signInAsCustomer('different-customer@test.local');
+      const appointment = await bookAppointment(owner, '15:00');
 
-    const unauthorizedCancellation = await request(app)
-      .post(`/api/bookings/${booking.body.booking._id}/cancel`)
-      .set('Authorization', `Bearer ${otherToken}`)
-      .send();
+      const response = await cancelAppointment(
+        appointment.body.booking._id,
+        stranger
+      );
 
-    expect(unauthorizedCancellation.status).toBe(403);
-    expect(unauthorizedCancellation.body.error).toBe('Not authorized to cancel this booking');
+      expect(response.status).toBe(403);
+      expect(response.body).toEqual({
+        error: 'Not authorized to cancel this booking'
+      });
+    });
   });
 });
